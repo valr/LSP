@@ -254,14 +254,17 @@ class WindowDocumentHandler(object):
 
     def purge_did_change(self, buffer_id: int, buffer_version: Optional[int] = None) -> None:
         if buffer_id not in self._pending_buffer_changes:
+            print('purge_did_change - NOTHING TO PURGE')
             return
 
         pending_buffer = self._pending_buffer_changes.get(buffer_id)
 
         if pending_buffer:
+            print('purge_did_change - HAS PENDING CHANGES')
             if buffer_version is None or buffer_version == pending_buffer["version"]:
                 self.notify_did_change(pending_buffer["view"])
                 self.changed()
+                print('purge_did_change - PURGED')
 
     def notify_did_change(self, view: ViewLike) -> None:
         file_name = view.file_name()
@@ -271,6 +274,7 @@ class WindowDocumentHandler(object):
                 self.handle_did_open(view)
 
             if view.buffer_id() in self._pending_buffer_changes:
+                print('notify_did_change - POPING PENDING CHANGES')
                 del self._pending_buffer_changes[view.buffer_id()]
                 # mypy: expected sublime.View, got ViewLike
                 notification = did_change(view)  # type: ignore
@@ -448,6 +452,7 @@ class WindowManager(object):
                 self._handle_post_exit,        # on_post_exit
                 lambda msg: self._handle_stderr_log(config.name, msg))  # on_stderr_log
         except Exception as e:
+            print(e)
             message = "\n\n".join([
                 "Could not start {}",
                 "{}",

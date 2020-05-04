@@ -3,55 +3,83 @@ import sublime_plugin
 from .core.edit import parse_workspace_edit
 from .core.protocol import Diagnostic
 from .core.protocol import Request, Point
-from .core.registry import LspTextCommand
+from .core.registry import LspTextCommand, LSPViewEventListener
 from .core.registry import sessions_for_view, client_from_session
 from .core.settings import settings
 from .core.typing import Any, List, Dict, Callable, Optional, Union, Tuple, Mapping, TypedDict
 from .core.url import filename_to_uri
-from .core.views import region_to_range
+from .core.views import entire_content_range, region_to_range
 from .diagnostics import filter_by_point, view_diagnostics
 
 CodeActionOrCommand = TypedDict('CodeActionOrCommand', {
     'title': str,
     'command': Union[dict, str],
-    'edit': dict
+    'edit': dict,
+    'kind': Optional[List[str]]
 }, total=False)
 CodeActionsResponse = Optional[List[CodeActionOrCommand]]
 CodeActionsByConfigName = Dict[str, List[CodeActionOrCommand]]
 
 
-class CodeActionsAtLocation(object):
-
-    def __init__(self, on_complete_handler: Callable[[CodeActionsByConfigName], None]) -> None:
-        self._commands_by_config = {}  # type: CodeActionsByConfigName
-        self._requested_configs = []  # type: List[str]
+class CodeActionsCollector(object):
+    def __init__(self, on_complete_handler: Callable[[CodeActionsByConfigName], None],
+                 only_kinds: Optional[List[str]] = None):
         self._on_complete_handler = on_complete_handler
+        self._only_kinds = only_kinds
+        self._commands_by_config = {}  # type: CodeActionsByConfigName
 
-    def collect(self, config_name: str) -> Callable[[CodeActionsResponse], None]:
+    def create_collector(self, config_name: str) -> Callable[[CodeActionsResponse], None]:
+        return lambda actions: self._collect(config_name, actions)
+
+    def _collect(self, config_name: str, actions: CodeActionsResponse) -> None:
+        self._commands_by_config[config_name] = self._filter_by_kind(actions or [])
+
+    def _filter_by_kind(self, actions: List[CodeActionOrCommand]) -> List[CodeActionOrCommand]:
+        if self._only_kinds:
+            return [action for action in actions if self._matches_kind(self._only_kinds, action.get('kind'))]
+        else:
+            return actions
+
+    def _matches_kind(self, requested_kinds: List[str], got_kind: str) -> bool:
+        if got_kind in requested_kinds:
+            return True
+        return False
+
+    def get_actions(self) -> CodeActionsByConfigName:
+        return self._commands_by_config
+
+    def deliver(self) -> None:
+        self._on_complete_handler(self._commands_by_config)
+
+
+class CodeActionsAsyncCollector(CodeActionsCollector):
+    def __init__(self, on_complete_handler: Callable[[CodeActionsByConfigName], None],
+                 only_kinds: Optional[List[str]] = None):
+        super().__init__(on_complete_handler, only_kinds)
+        self._requested_configs = []  # type: List[str]
+
+    def create_collector(self, config_name: str) -> Callable[[CodeActionsResponse], None]:
         self._requested_configs.append(config_name)
-        return lambda actions: self.store(config_name, actions)
+        return super().create_collector(config_name)
 
-    def store(self, config_name: str, actions: CodeActionsResponse) -> None:
-        self._commands_by_config[config_name] = actions or []
+    def _collect(self, config_name: str, actions: CodeActionsResponse) -> None:
+        super()._collect(config_name, actions)
         if len(self._requested_configs) == len(self._commands_by_config):
-            self._on_complete_handler(self._commands_by_config)
-
-    def deliver(self, recipient_handler: Callable[[CodeActionsByConfigName], None]) -> None:
-        recipient_handler(self._commands_by_config)
+            self.deliver()
 
 
 class CodeActionsManager(object):
     """ Collects and caches code actions"""
 
     def __init__(self) -> None:
-        self._requests = {}  # type: Dict[str, CodeActionsAtLocation]
+        self._requests = {}  # type: Dict[str, CodeActionsCollector]
 
     def request(self, view: sublime.View, point: int,
                 actions_handler: Callable[[CodeActionsByConfigName], None]) -> None:
         current_location = self.get_location_key(view, point)
         # debug("requesting actions for {}".format(current_location))
         if current_location in self._requests:
-            self._requests[current_location].deliver(actions_handler)
+            actions_handler(self._requests[current_location].get_actions())
         else:
             self._requests.clear()
             self._requests[current_location] = request_code_actions(view, point, actions_handler)
@@ -63,45 +91,91 @@ class CodeActionsManager(object):
 actions_manager = CodeActionsManager()
 
 
-def request_code_actions(view: sublime.View, point: int,
-                         actions_handler: Callable[[CodeActionsByConfigName], None]) -> CodeActionsAtLocation:
-    diagnostics_by_config = filter_by_point(view_diagnostics(view), Point(*view.rowcol(point)))
-    return request_code_actions_with_diagnostics(view, diagnostics_by_config, point, actions_handler)
+def request_code_actions(view: sublime.View, point: Optional[int],
+                         actions_handler: Callable[[CodeActionsByConfigName], None],
+                         only_kind: Optional[List[str]] = None,
+                         blocking: bool = False) -> CodeActionsCollector:
+    print('request_code_actions REQUESTING')
+    diagnostics_by_config = view_diagnostics(view)
+    if point is not None:
+        diagnostics_by_config = filter_by_point(diagnostics_by_config, Point(*view.rowcol(point)))
+    print('request_code_actions REQUESTED', diagnostics_by_config)
+    return _request_code_actions_with_diagnostics(
+        view, diagnostics_by_config, point, actions_handler, only_kind, blocking)
 
 
-def request_code_actions_with_diagnostics(view: sublime.View, diagnostics_by_config: Dict[str, List[Diagnostic]],
-                                          point: int, actions_handler: Callable[[CodeActionsByConfigName], None]
-                                          ) -> CodeActionsAtLocation:
-
-    actions_at_location = CodeActionsAtLocation(actions_handler)
+def _request_code_actions_with_diagnostics(view: sublime.View, diagnostics_by_config: Dict[str, List[Diagnostic]],
+                                           point: Optional[int],
+                                           actions_handler: Callable[[CodeActionsByConfigName], None],
+                                           only_kind: Optional[List[str]] = None,
+                                           blocking: Optional[bool] = False) -> CodeActionsCollector:
+    CodeActionsCollectorType = CodeActionsCollector if blocking else CodeActionsAsyncCollector
+    actions_collector = CodeActionsCollectorType(actions_handler, only_kind)
 
     for session in sessions_for_view(view, point):
+        file_name = view.file_name()
+        if not file_name or not session.client or not session.has_capability('codeActionProvider'):
+            continue
 
-        if session.has_capability('codeActionProvider'):
-            if session.config.name in diagnostics_by_config:
-                point_diagnostics = diagnostics_by_config[session.config.name]
-                file_name = view.file_name()
-                relevant_range = point_diagnostics[0].range if point_diagnostics else region_to_range(
-                    view,
-                    view.sel()[0])
-                if file_name:
-                    params = {
-                        "textDocument": {
-                            "uri": filename_to_uri(file_name)
-                        },
-                        "range": relevant_range.to_lsp(),
-                        "context": {
-                            "diagnostics": list(diagnostic.to_lsp() for diagnostic in point_diagnostics)
-                        }
-                    }
-                    if session.client:
-                        session.client.send_request(
-                            Request.codeAction(params),
-                            actions_at_location.collect(session.config.name))
-    return actions_at_location
+        if session.config.name in diagnostics_by_config:
+            diagnostics = diagnostics_by_config[session.config.name]
+            if point is None:  # whole document
+                relevant_range = entire_content_range(view)
+            else:
+                relevant_range = diagnostics[0].range if diagnostics else region_to_range(view, view.sel()[0])
+            params = {
+                "textDocument": {
+                    "uri": filename_to_uri(file_name)
+                },
+                "range": relevant_range.to_lsp(),
+                "context": {
+                    "diagnostics": list(diagnostic.to_lsp() for diagnostic in diagnostics)
+                }
+            }
+            if only_kind:
+                params['context']['only'] = only_kind
+
+            RequestMethod = session.client.execute_request if blocking else session.client.send_request
+            RequestMethod(Request.codeAction(params), actions_collector.create_collector(session.config.name))
+
+    if blocking:
+        actions_collector.deliver()
+
+    return actions_collector
 
 
-class LspCodeActionBulbListener(sublime_plugin.ViewEventListener):
+class LspCodeActionsOnSaveListener(LSPViewEventListener):
+    @classmethod
+    def is_applicable(cls, view_settings: dict) -> bool:
+        return len(cls.get_enabled_code_actions_on_save(view_settings)) > 0
+
+    @classmethod
+    def get_enabled_code_actions_on_save(self, view_settings: dict) -> List[str]:
+        view_code_actions = view_settings.get('lsp_code_actions_on_save', {})
+        code_actions = settings.lsp_code_actions_on_save.copy()
+        code_actions.update(view_code_actions)
+        return [action for action, enabled in code_actions.items() if enabled]
+
+    def on_pre_save(self) -> None:
+        if self.view.file_name():
+            print('ON_PRE_SAVE')
+            self.trigger_code_actions()
+
+    def trigger_code_actions(self) -> None:
+        code_actions = self.get_enabled_code_actions_on_save(self.view.settings())
+        if code_actions:
+            print('trigger_code_actions - TRYING TO PURGE')
+            self.manager.documents.purge_changes(self.view)
+            request_code_actions(self.view, None, lambda response: self.handle_response(response),
+                                 only_kind=code_actions, blocking=True)
+
+    def handle_response(self, responses: CodeActionsByConfigName) -> None:
+        for config_name, code_actions in responses.items():
+            for code_action in code_actions:
+                run_code_action_or_command(self.view, config_name, code_action)
+
+
+class LspCodeActionBulbListener(LSPViewEventListener):
     def __init__(self, view: sublime.View) -> None:
         super().__init__(view)
         self._stored_region = sublime.Region(-1, -1)
@@ -109,9 +183,7 @@ class LspCodeActionBulbListener(sublime_plugin.ViewEventListener):
 
     @classmethod
     def is_applicable(cls, _settings: dict) -> bool:
-        if settings.show_code_actions_bulb:
-            return True
-        return False
+        return settings.show_code_actions_bulb
 
     def on_selection_modified_async(self) -> None:
         self.hide_bulb()

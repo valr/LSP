@@ -81,7 +81,7 @@ def get_initialize_params(workspace_folders: List[WorkspaceFolder], config: Clie
                 "dynamicRegistration": True,
                 "codeActionLiteralSupport": {
                     "codeActionKind": {
-                        "valueSet": []
+                        "valueSet": ["quickfix", "refactor"]
                     }
                 }
             },
