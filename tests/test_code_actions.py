@@ -17,7 +17,7 @@ def create_test_code_action(document_version: int, edits: List[Tuple[str, Range]
             "newText": new_text,
             "range": range.to_lsp()
         }
-    actions = {
+    action = {
         "title": "Fix errors",
         "edit": {
             "documentChanges": [
@@ -32,8 +32,8 @@ def create_test_code_action(document_version: int, edits: List[Tuple[str, Range]
         }
     }
     if kind:
-        actions['kind'] = kind
-    return actions
+        action['kind'] = kind
+    return action
 
 
 def create_test_diagnostics(diagnostics: List[Tuple[str, Range]]) -> Dict:
@@ -77,9 +77,10 @@ class CodeActionsOnSaveTestCase(TextDocumentTestCase):
         yield from super().setUp()
         self.view.settings().set('lsp_code_actions_on_save', {'source.fixAll': True})
 
-    def doCleanups(self) -> Generator:
-        yield from super().doCleanups()
+    def tearDown(self):
+        yield from self.await_clear_view_and_save()
         self.view.settings().set('lsp_code_actions_on_save', {})
+        yield from super().tearDown()
 
     def get_test_server_capabilities(self) -> dict:
         capabilities = deepcopy(super().get_test_server_capabilities())
@@ -87,7 +88,7 @@ class CodeActionsOnSaveTestCase(TextDocumentTestCase):
         return capabilities
 
     def test_applies_matching_kind(self) -> Generator:
-        yield from self._setup_document_with_missing_missing()
+        yield from self._setup_document_with_missing_semicolon()
         code_action_kind = 'source.fixAll'
         code_action = create_test_code_action(
             self.view.change_count(),
@@ -98,10 +99,22 @@ class CodeActionsOnSaveTestCase(TextDocumentTestCase):
         self.view.run_command('save')
         yield from self.await_message('textDocument/codeAction')
         self.assertEquals(entire_content(self.view), 'const x = 1;')
-        yield from self.await_clear_view_and_save()
+
+    def test_applies_immediately_after_text_change(self) -> Generator:
+        self.insert_characters('const x = 1')
+        code_action_kind = 'source.fixAll'
+        code_action = create_test_code_action(
+            self.view.change_count(),
+            [(';', Range(Point(0, 11), Point(0, 11)))],
+            code_action_kind
+        )
+        self.set_response('textDocument/codeAction', [code_action])
+        self.view.run_command('save')
+        yield from self.await_message('textDocument/codeAction')
+        self.assertEquals(entire_content(self.view), 'const x = 1;')
 
     def test_no_matching_kind(self) -> Generator:
-        yield from self._setup_document_with_missing_missing()
+        yield from self._setup_document_with_missing_semicolon()
         initial_content = 'const x = 1'
         code_action_kind = 'source.fixOther'
         code_action = create_test_code_action(
@@ -113,9 +126,8 @@ class CodeActionsOnSaveTestCase(TextDocumentTestCase):
         self.view.run_command('save')
         yield from self.await_message('textDocument/codeAction')
         self.assertEquals(entire_content(self.view), initial_content)
-        yield from self.await_clear_view_and_save()
 
-    def _setup_document_with_missing_missing(self) -> Generator:
+    def _setup_document_with_missing_semicolon(self) -> Generator:
         self.insert_characters('const x = 1')
         yield from self.await_message("textDocument/didChange")
         yield from self.await_client_notification(
