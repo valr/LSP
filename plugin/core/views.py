@@ -197,7 +197,7 @@ RE = re.compile(
     r'(?P<entity>[&<> \t\n])|(?P<url>https?://(?:[\w\d:#@%/;$()~_?\+\-=\\\.&](?:#!)?)*)',
     flags=re.IGNORECASE)
 
-ENTITY_MAP = {
+REPLACEMENT_MAP = {
     "&": "&amp;",
     "<": "&lt;",
     ">": "&gt;",
@@ -210,7 +210,7 @@ ENTITY_MAP = {
 def _replace_match(match: Any) -> str:
     entity_match = match.group('entity')
     if entity_match:
-        return ENTITY_MAP[entity_match]
+        return REPLACEMENT_MAP[entity_match]
     url = match.group('url')
     return "<a href='{}'>{}</a>".format(url, url)
 
