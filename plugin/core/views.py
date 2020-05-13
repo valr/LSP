@@ -193,19 +193,27 @@ def minihtml(view: sublime.View, content: Union[str, dict]) -> str:
         return ''
 
 
+RE = re.compile(
+    r'(?P<entity>[&<> \t\n])|(?P<url>https?://(?:[\w\d:#@%/;$()~_?\+\-=\\\.&](?:#!)?)*)',
+    flags=re.IGNORECASE)
+
+ENTITY_MAP = {
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    " ": "&nbsp;",
+    "\t": 4 * "&nbsp;",
+    "\n": "<br>"
+}
+
+
+def _replace_match(match: Any) -> str:
+    entity_match = match.group('entity')
+    if entity_match:
+        return ENTITY_MAP[entity_match]
+    url = match.group('url')
+    return "<a href='{}'>{}</a>".format(url, url)
+
+
 def text2html(content: str) -> str:
-    content = html.escape(content).replace('\n', '<br>').replace('\t', '&nbsp;&nbsp;&nbsp;&nbsp;')
-
-    def replace_nbsp(match: Any) -> str:
-        spaces = match.group(0)
-        return "&nbsp;" * len(spaces)
-
-    # if there are 2 or more spaces, replace them with &nbsp;
-    content = re.sub(r"( {2,})", replace_nbsp, content)
-
-    def replace_url_with_link(match: Any) -> str:
-        url = match.group(0)
-        return "<a href='{}'>{}</a>".format(url, url)
-
-    FIND_URL = re.compile(r'(https?://(?:[\w\d:#@%/;$()~_?\+\-=\\\.&](?:#!)?)*)', flags=re.IGNORECASE)
-    return re.sub(FIND_URL, replace_url_with_link, content)
+    return re.sub(RE, _replace_match, content)
